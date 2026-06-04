@@ -1,5 +1,6 @@
 https://colab.research.google.com/drive/1IC6Q1hLF55_tK6mhky0SWYKGVF9T5WsY
 <br>
+It fixes issues with MDX23C models above.
 <br>
 # Music Source Separation Universal Training Code
 
