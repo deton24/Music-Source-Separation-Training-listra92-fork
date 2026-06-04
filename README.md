@@ -1,6 +1,8 @@
 https://colab.research.google.com/drive/1IC6Q1hLF55_tK6mhky0SWYKGVF9T5WsY
 <br>
-It fixes issues with MDX23C models above.
+It fixes issues with MDX23C above.
+<br>
+https://colab.research.google.com/github/deton24/Music-Source-Separation-Training-listra92-fork/blob/main/Music_Source_Separation_Training_%28Colab_Inference%29.ipynb (the phantom center works for now)
 <br>
 # Music Source Separation Universal Training Code
 
