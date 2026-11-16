@@ -1,0 +1,128 @@
+# ============================================================================
+# drumsep_ht_roformer - HTRoFormer drum separator
+# ============================================================================
+# Architecture: HTRoFormer (Hybrid Transformer RoFormer) - a hybrid dual-branch
+#   model, not a plain BS-RoFormer variant.
+#   spectral branch: BS-RoFormer backbone (62-band BandSplit + 12x(time,freq)
+#                    transformer + 6 mask heads)
+#   time branch:     small U-Net (2->64->128->192->256, strides 8/8/16, every stage
+#                    aligned to the 1024-sample hop)
+#   bridges:         one cross-attention bridge after layer 0/3/6/9, exchanging
+#                    information in both directions
+#   outputs:         masked STFT (real/imag) + time-domain residual;
+#                    stems = istft(mask * STFT) + residual
+# STFT: n_fft 2048 / hop 1024 / win 2048; window 266240 samples ~= 6.04 s @44.1 kHz (261 frames)
+# ============================================================================
+
+audio:
+  chunk_size: 266240        # must be a multiple of 1024 (time branch stride 8*8*16, STFT hop 1024)
+  dim_f: 1025
+  dim_t: 261
+  hop_length: 1024
+  n_fft: 2048
+  num_channels: 2
+  sample_rate: 44100
+  min_mean_abs: 0.0
+
+model:
+  dim: 256
+  depth: 12
+  stereo: true
+  num_stems: 6
+  heads: 8
+  dim_head: 64
+  time_transformer_depth: 1
+  freq_transformer_depth: 1
+  attn_dropout: 0.0
+  ff_dropout: 0.0
+  ff_mult: 4
+  flash_attn: true
+  mask_estimator_depth: 2
+  mlp_expansion_factor: 4
+  use_shared_bias: true        # 4 shared biases: qkv(1536) / out(256) / cross-q(512) / cross-kv(1024)
+  stft_n_fft: 2048
+  stft_hop_length: 1024
+  stft_win_length: 2048
+  stft_normalized: false
+  bridge_layers: [0, 3, 6, 9]
+  time_channels: [64, 128, 192, 256]
+  time_strides: [8, 8, 16]
+  time_kernel: 16
+  output_mode: sum             # sum | spectral | time (both branches are emitted; stems = spectral + time)
+  standardize_eps: 1.0e-5      # the model standardises the whole mixture as (x-mean)/(std+eps)
+  freqs_per_bands: !!python/tuple
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 4
+    - 12
+    - 12
+    - 12
+    - 12
+    - 12
+    - 12
+    - 12
+    - 12
+    - 24
+    - 24
+    - 24
+    - 24
+    - 24
+    - 24
+    - 24
+    - 24
+    - 48
+    - 48
+    - 48
+    - 48
+    - 48
+    - 48
+    - 48
+    - 48
+    - 128
+    - 129
+
+training:
+  # Output channel order (measured with a synthetic-kit correlation probe, see README).
+  # The model order is kick, snare, hihat, tom, cymbal, other - note hihat precedes tom.
+  instruments: ['kick', 'snare', 'hihat', 'tom', 'cymbal', 'other']
+  target_instrument: null
+  use_amp: false              # the model runs its own STFT/standardisation; keep fp32 end to end
+
+inference:
+  batch_size: 1
+  dim_t: 261
+  overlap: 2
+  normalize: false             # do not stack pymss input standardisation on top; the model does it
