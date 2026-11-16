@@ -311,4 +311,365 @@ class CrossAttention(Module):
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.,
                  shared_q_bias=None, shared_kv_bias=None, shared_out_bias=None):
         super().__init__()
-        self.heads,
+        self.heads, self.dim_head = heads, dim_head
+        self.dropout = dropout
+        inner = heads * dim_head
+        self.norm = RMSNorm(dim)
+        self.norm_ctx = RMSNorm(dim)
+        self.q = nn.Linear(dim, inner, bias=(shared_q_bias is not None))
+        self.kv = nn.Linear(dim, inner * 2, bias=(shared_kv_bias is not None))
+        if shared_q_bias is not None:
+            self.q.bias = shared_q_bias
+        if shared_kv_bias is not None:
+            self.kv.bias = shared_kv_bias
+        self.out = nn.Linear(inner, dim, bias=(shared_out_bias is not None))
+        if shared_out_bias is not None:
+            self.out.bias = shared_out_bias
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x, context):
+        b, n = x.shape[:2]
+        q = self.q(self.norm(x)).view(b, n, self.heads, self.dim_head).transpose(1, 2)
+        kv = self.kv(self.norm_ctx(context)).view(b, n, 2, self.heads, self.dim_head)
+        k, v = kv.unbind(dim=2)
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
+
+        dropout_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = out.transpose(1, 2).reshape(b, n, -1)
+        return self.out(out) * self.scale
+
+
+class CrossBridge(Module):
+    """Time self-attention + band-mean spectral context, then cross attention in both directions."""
+
+    def __init__(self, dim, heads, dim_head, rotary_embed, shared_qkv_bias, shared_out_bias,
+                 shared_q_bias, shared_kv_bias, attn_dropout=0., ff_dropout=0.,
+                 ff_mult=4, flash_attn=True):
+        super().__init__()
+        self.time_self_attn = Attention(
+            dim, heads=heads, dim_head=dim_head, dropout=attn_dropout,
+            shared_qkv_bias=shared_qkv_bias, shared_out_bias=shared_out_bias,
+            rotary_embed=rotary_embed, flash=flash_attn,
+        )
+        self.time_self_ff = FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout)
+        self.freq_to_time_proj = nn.Sequential(RMSNorm(dim), nn.Linear(dim, dim))
+        self.time_cross = CrossAttention(dim, heads, dim_head, attn_dropout,
+                                         shared_q_bias, shared_kv_bias, shared_out_bias)
+        self.freq_cross = CrossAttention(dim, heads, dim_head, attn_dropout,
+                                         shared_q_bias, shared_kv_bias, shared_out_bias)
+
+    def forward(self, x_time, x_freq):
+        t = x_time + self.time_self_attn(x_time)
+        t = t + self.time_self_ff(t)
+
+        context = self.freq_to_time_proj(x_freq.mean(dim=2))          # band mean -> time-side context
+        x_time = t + self.time_cross(t, context)
+
+        b, n, f, d = x_freq.shape
+        flat = x_freq.permute(0, 2, 1, 3).reshape(b * f, n, d)        # one sequence per band
+        freq_ctx = x_time.unsqueeze(1).expand(b, f, n, d).reshape(b * f, n, d)
+        x_freq = (flat + self.freq_cross(flat, freq_ctx)).reshape(b, f, n, d).permute(0, 2, 1, 3)
+        return x_time, x_freq
+
+
+# --------------------------------------------------------------------------- #
+# Main class exposed as BSRoformer for MSST bs_roformer_custom
+# --------------------------------------------------------------------------- #
+
+class BSRoformer(Module):
+    """HTRoFormer: STFT mask head + time-domain residual head, compatible with MSST bs_roformer_custom."""
+
+    def __init__(
+        self,
+        dim=256,
+        *,
+        depth=12,
+        stereo=True,
+        num_stems=6,
+        heads=8,
+        dim_head=64,
+        time_transformer_depth=1,
+        freq_transformer_depth=1,
+        attn_dropout=0.,
+        ff_dropout=0.,
+        ff_mult=4,
+        flash_attn=True,
+        mlp_expansion_factor=4,
+        mask_estimator_depth=2,
+        use_shared_bias=True,
+        freqs_per_bands: Tuple[int, ...] = DEFAULT_FREQS_PER_BANDS,
+        stft_n_fft=2048,
+        stft_hop_length=1024,
+        stft_win_length=2048,
+        stft_normalized=False,
+        stft_window_fn: Optional[Callable] = None,
+        bridge_layers=ROFORMER_BLOCKS,
+        time_channels=(64, 128, 192, 256),
+        time_strides=(8, 8, 16),
+        time_kernel=TIME_KERNEL,
+        output_mode="sum",
+        standardize_eps=1e-5,
+        # MSST BS-Roformer multi-resolution STFT loss params (for train.py loss = model(x, y))
+        multi_stft_resolution_loss_weight=1.,
+        multi_stft_resolutions_window_sizes: Tuple[int, ...] = (4096, 2048, 1024, 512, 256),
+        multi_stft_hop_size=147,
+        multi_stft_normalized=False,
+        multi_stft_window_fn: Callable = torch.hann_window,
+        **kwargs,
+    ):
+        super().__init__()
+        self.stereo = stereo
+        self.audio_channels = 2 if stereo else 1
+        self.num_stems = int(num_stems)
+        self.output_mode = output_mode
+        self.standardize_eps = float(standardize_eps)
+        self.time_channels = tuple(int(c) for c in time_channels)
+        self.time_strides = tuple(int(s) for s in time_strides)
+        self.stride_product = self.time_strides[0] * self.time_strides[1] * self.time_strides[2]
+        self.bridge_layers = tuple(int(l) for l in bridge_layers)
+        freqs_per_bands = tuple(int(f) for f in freqs_per_bands)
+
+        self.stft_kwargs = dict(
+            n_fft=int(stft_n_fft),
+            hop_length=int(stft_hop_length),
+            win_length=int(stft_win_length),
+            normalized=bool(stft_normalized),
+        )
+        self.stft_window_fn = partial(default(stft_window_fn, torch.hann_window), int(stft_win_length))
+
+        # four shared biases: qkv / out / cross-q / cross-kv
+        inner = heads * dim_head
+        if use_shared_bias:
+            self.linear_62_bias_0 = nn.Parameter(torch.ones(inner * 3))
+            self.linear_64_bias_0 = nn.Parameter(torch.ones(dim))
+            self.linear_78_bias_0 = nn.Parameter(torch.ones(inner))
+            self.linear_79_bias_0 = nn.Parameter(torch.ones(inner * 2))
+        else:
+            self.linear_62_bias_0 = None
+            self.linear_64_bias_0 = None
+            self.linear_78_bias_0 = None
+            self.linear_79_bias_0 = None
+
+        # ---- spectral branch -------------------------------------------------
+        self.rotary_embed = RotaryEmbedding(dim=dim_head)
+        transformer_kwargs = dict(
+            dim=dim,
+            heads=heads,
+            dim_head=dim_head,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+            ff_mult=ff_mult,
+            flash_attn=flash_attn,
+            norm_output=False,
+            shared_qkv_bias=self.linear_62_bias_0,
+            shared_out_bias=self.linear_64_bias_0,
+        )
+        self.layers = ModuleList([
+            ModuleList([
+                Transformer(depth=time_transformer_depth, rotary_embed=self.rotary_embed, **transformer_kwargs),
+                Transformer(depth=freq_transformer_depth, rotary_embed=self.rotary_embed, **transformer_kwargs),
+            ]) for _ in range(depth)
+        ])
+        self.cross_bridges = ModuleList([
+            CrossBridge(
+                dim, heads, dim_head, self.rotary_embed,
+                self.linear_62_bias_0, self.linear_64_bias_0,
+                self.linear_78_bias_0, self.linear_79_bias_0,
+                attn_dropout, ff_dropout, ff_mult=ff_mult, flash_attn=flash_attn,
+            ) for _ in self.bridge_layers
+        ])
+
+        n_bins = int(stft_win_length) // 2 + 1
+        assert sum(freqs_per_bands) == n_bins, f'freqs_per_bands must cover {n_bins} bins'
+        dim_inputs = tuple(2 * f * self.audio_channels for f in freqs_per_bands)
+        self.band_split = BandSplit(dim=dim, dim_inputs=dim_inputs)
+        self.final_norm = RMSNorm(dim)
+        self.mask_estimators = ModuleList([
+            MaskEstimator(dim=dim, dim_inputs=dim_inputs, depth=mask_estimator_depth,
+                          mlp_expansion_factor=mlp_expansion_factor)
+            for _ in range(self.num_stems)
+        ])
+
+        # ---- time branch -----------------------------------------------------
+        c0, c1, c2, c3 = self.time_channels
+        self.time_input_conv = nn.Sequential(
+            nn.Conv1d(self.audio_channels, c0, 7, padding=3),
+            nn.GroupNorm(1, c0),
+            nn.GELU(),
+        )
+        self.time_encoder = ModuleList([
+            TimeEncoderStage(c0, c1, self.time_strides[0], time_kernel=time_kernel),
+            TimeEncoderStage(c1, c2, self.time_strides[1], time_kernel=time_kernel),
+            TimeEncoderStage(c2, c3, self.time_strides[2], time_kernel=time_kernel),
+        ])
+        self.time_decoder = ModuleList([
+            TimeDecoderStage(c3, c2, self.time_strides[2], time_kernel=time_kernel),
+            TimeDecoderStage(c2, c1, self.time_strides[1], time_kernel=time_kernel),
+            TimeDecoderStage(c1, c0, self.time_strides[0], time_kernel=time_kernel),
+        ])
+        self.time_output_conv = nn.Conv1d(c0, self.num_stems * self.audio_channels, 7, padding=3)
+
+        # ---- multi-resolution stft loss (when called with target) ------------
+        self.multi_stft_resolution_loss_weight = multi_stft_resolution_loss_weight
+        self.multi_stft_resolutions_window_sizes = tuple(multi_stft_resolutions_window_sizes)
+        self.multi_stft_n_fft = int(stft_n_fft)
+        self.multi_stft_window_fn = multi_stft_window_fn
+        self.multi_stft_kwargs = dict(
+            hop_length=int(multi_stft_hop_size),
+            normalized=bool(multi_stft_normalized),
+        )
+
+    # ------------------------------------------------------------------ #
+    def forward(self, raw_audio, target=None, return_loss_breakdown=False):
+        """raw_audio: (b, channels, length) -> (b, num_stems, channels, length) or loss if target is given."""
+        device = raw_audio.device
+        x_is_mps = device.type == "mps"
+        amp_off = (
+            torch.amp.autocast(device_type=device.type, enabled=False)
+            if device.type in ("cuda", "cpu")
+            else nullcontext()
+        )
+
+        if raw_audio.ndim == 2:
+            raw_audio = raw_audio.unsqueeze(1)
+
+        batch, channels, length = raw_audio.shape
+        assert channels == self.audio_channels, f'expected {self.audio_channels} channels, got {channels}'
+        assert length % self.stride_product == 0, (
+            f'length must be a multiple of {self.stride_product} '
+            f'(time branch strides {self.time_strides}), got {length}'
+        )
+
+        # ---- fp32 standardisation + STFT ------------------------------------
+        with amp_off:
+            raw_f32 = raw_audio.float()
+            mean = raw_f32.mean(dim=(1, 2), keepdim=True)
+            std = raw_f32.var(dim=(1, 2), unbiased=False, keepdim=True).sqrt()
+            normalized = (raw_f32 - mean) / (std + self.standardize_eps)
+
+            stft_window = self.stft_window_fn(device=device).float()
+            flat = raw_f32.reshape(batch * channels, length)
+            try:
+                spec = torch.stft(flat, **self.stft_kwargs, window=stft_window, return_complex=True)
+            except RuntimeError:
+                _flat = flat.cpu() if x_is_mps else flat
+                _window = stft_window.cpu() if x_is_mps else stft_window
+                spec = torch.stft(_flat, **self.stft_kwargs, window=_window, return_complex=True).to(device)
+
+            n_bins, frames = spec.shape[-2], spec.shape[-1]
+            spec = spec.view(batch, channels, n_bins, frames)
+
+            # band-split input: (b, t, f*s*2), freq major, then channel, real/imag last
+            feats = torch.view_as_real(spec).permute(0, 3, 2, 1, 4).reshape(batch, frames, -1)
+
+        # ---- time branch -----------------------------------------------------
+        hidden = self.time_input_conv(normalized.to(raw_audio.dtype))
+        skips = [hidden]
+        for stage in self.time_encoder:
+            hidden = stage(hidden)
+            skips.append(hidden)
+        hidden = hidden.transpose(1, 2)                       # (b, t, dim)
+
+        # ---- spectral branch + bridges ---------------------------------------
+        x = self.band_split(feats.to(raw_audio.dtype))
+        bridge_index = 0
+        for index, (time_transformer, freq_transformer) in enumerate(self.layers):
+            b, t, f, d = x.shape
+
+            x = x.permute(0, 2, 1, 3).reshape(b * f, t, d)
+            x = time_transformer(x)
+            x = x.reshape(b, f, t, d).permute(0, 2, 1, 3)
+
+            x = x.reshape(b * t, f, d)
+            x = freq_transformer(x)
+            x = x.reshape(b, t, f, d)
+
+            if index in self.bridge_layers:
+                hidden, x = self.cross_bridges[bridge_index](hidden, x)
+                bridge_index += 1
+
+        x = self.final_norm(x)
+
+        mask = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
+
+        # ---- back to audio (fp32 iSTFT) -------------------------------------
+        with amp_off:
+            mask_f32 = mask.float().reshape(batch, self.num_stems, frames, -1, 2).permute(0, 1, 3, 2, 4)
+            spec_ri = torch.view_as_real(spec).permute(0, 2, 1, 3, 4).reshape(batch, 1, n_bins * channels, frames, 2)
+            masked = torch.view_as_complex(spec_ri.contiguous()) * torch.view_as_complex(mask_f32.contiguous())
+
+            spectral = torch.view_as_real(masked).view(batch, self.num_stems, n_bins, channels, frames, 2)
+            spectral = spectral.permute(0, 1, 3, 2, 4, 5).reshape(batch * self.num_stems * channels, n_bins, frames, 2)
+            spectral = torch.view_as_complex(spectral.contiguous())
+            try:
+                spectral = torch.istft(spectral, **self.stft_kwargs, window=stft_window,
+                                       return_complex=False, length=length)
+            except RuntimeError:
+                _spec = spectral.cpu() if x_is_mps else spectral
+                _window = stft_window.cpu() if x_is_mps else stft_window
+                spectral = torch.istft(_spec, **self.stft_kwargs, window=_window,
+                                       return_complex=False, length=length).to(device)
+            spectral = spectral.view(batch, self.num_stems, self.audio_channels, length)
+
+        # ---- time decoder ----------------------------------------------------
+        hidden = hidden.transpose(1, 2)                       # (b, dim, t)
+        for stage, skip in zip(self.time_decoder, (skips[2], skips[1], skips[0])):
+            hidden = stage(hidden, skip)
+        residual = self.time_output_conv(hidden)
+        residual = residual.view(batch, self.num_stems, self.audio_channels, length)
+        with amp_off:
+            residual = residual.float() * std.view(-1, 1, 1, 1) + mean.view(-1, 1, 1, 1)
+
+        if self.output_mode == "spectral":
+            recon_audio = spectral
+        elif self.output_mode == "time":
+            recon_audio = residual
+        else:
+            recon_audio = spectral + residual
+
+        if self.num_stems == 1:
+            recon_audio = recon_audio.squeeze(1)
+
+        if not exists(target):
+            return recon_audio
+
+        if self.num_stems > 1:
+            assert target.ndim == 4 and target.shape[1] == self.num_stems
+
+        if target.ndim == 2:
+            target = target.unsqueeze(1)
+
+        target = target[..., :recon_audio.shape[-1]]
+
+        with amp_off:
+            recon_f32 = recon_audio.float()
+            target_f32 = target.float()
+            loss = F.l1_loss(recon_f32, target_f32)
+
+            multi_stft_resolution_loss = 0.
+            recon_flat = recon_f32.reshape(-1, recon_f32.shape[-1])
+            target_flat = target_f32.reshape(-1, target_f32.shape[-1])
+
+            for window_size in self.multi_stft_resolutions_window_sizes:
+                res_stft_kwargs = dict(
+                    n_fft=max(window_size, self.multi_stft_n_fft),
+                    win_length=window_size,
+                    return_complex=True,
+                    window=self.multi_stft_window_fn(window_size, device=device).float(),
+                    **self.multi_stft_kwargs,
+                )
+                recon_Y = torch.stft(recon_flat, **res_stft_kwargs)
+                target_Y = torch.stft(target_flat, **res_stft_kwargs)
+                multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(recon_Y, target_Y)
+
+            weighted_multi_resolution_loss = multi_stft_resolution_loss * self.multi_stft_resolution_loss_weight
+            total_loss = loss + weighted_multi_resolution_loss
+
+        if not return_loss_breakdown:
+            return total_loss
+
+        return total_loss, (loss, multi_stft_resolution_loss)
+
+
+HybridTransformerRoFormer = BSRoformer
